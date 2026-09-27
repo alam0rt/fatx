@@ -25,6 +25,12 @@
  */
 int fatx_dirent_to_attr(struct fatx_fs *fs, struct fatx_raw_directory_entry *entry, struct fatx_attr *attr)
 {
+    if (entry->filename_len > FATX_MAX_FILENAME_LEN)
+    {
+        fatx_error(fs, "invalid filename length %d\n", entry->filename_len);
+        return FATX_STATUS_ERROR;
+    }
+
     memcpy(attr->filename, entry->filename, entry->filename_len);
     attr->filename[entry->filename_len] = '\0';
 
