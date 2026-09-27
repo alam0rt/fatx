@@ -30,3 +30,18 @@ fatxfs xbox_hdd.img c
 [[ $(checksum $DST_PATH) = $(checksum $SRC_PATH) ]]
 sleep 1
 fusermount -u c
+
+# A file must survive when fatxfs stops without an unmount. The FAT stayed in
+# the cache until unmount, so the file was lost.
+fatxfs xbox_hdd.img c -f &
+FATXFS_PID=$!
+sleep 1
+DST_PATH="c/killed.bin"
+cp $SRC_PATH $DST_PATH
+kill -9 $FATXFS_PID
+wait $FATXFS_PID || true
+fusermount -u c
+fatxfs xbox_hdd.img c
+[[ $(checksum $DST_PATH) = $(checksum $SRC_PATH) ]]
+sleep 1
+fusermount -u c

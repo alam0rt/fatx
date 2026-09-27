@@ -40,11 +40,22 @@ extern "C" {
 #define FATX_ATTR_VOLUME             (1<<3)
 #define FATX_ATTR_DIRECTORY          (1<<4)
 
+#define FATX_STATUS_FILE_TOO_LARGE  -10
+#define FATX_STATUS_INVALID         -9
+#define FATX_STATUS_NAME_TOO_LONG   -8
+#define FATX_STATUS_NOT_DIRECTORY   -7
+#define FATX_STATUS_IS_DIRECTORY    -6
+#define FATX_STATUS_NOT_EMPTY       -5
+#define FATX_STATUS_EXISTS          -4
+#define FATX_STATUS_NO_SPACE        -3
 #define FATX_STATUS_FILE_NOT_FOUND  -2
 #define FATX_STATUS_ERROR           -1
 #define FATX_STATUS_SUCCESS          0
 #define FATX_STATUS_FILE_DELETED     1
 #define FATX_STATUS_END_OF_DIR       2
+
+/* The directory entry stores the file size in 32 bits. */
+#define FATX_MAX_FILE_SIZE           0xffffffffULL
 
 #define FATX_RETAIL_CLUSTER_SIZE     (16 * 1024)
 #define FATX_RETAIL_PARTITION_COUNT  5
@@ -92,6 +103,7 @@ struct fatx_fs {
     FILE             *log_handle;
     int               log_level;
     struct fatx_cache fat_cache;
+    size_t            alloc_hint;
 };
 
 struct fatx_dir {
@@ -141,6 +153,8 @@ enum fatx_format {
 /* FATX Functions */
 int fatx_open_device(struct fatx_fs *fs, char const *path, uint64_t offset, uint64_t size, size_t sector_size, size_t sectors_per_cluster);
 int fatx_close_device(struct fatx_fs *fs);
+int fatx_flush(struct fatx_fs *fs);
+int fatx_sync(struct fatx_fs *fs);
 int fatx_open_dir(struct fatx_fs *fs, char const *path, struct fatx_dir *dir);
 int fatx_read_dir(struct fatx_fs *fs, struct fatx_dir *dir, struct fatx_dirent *entry, struct fatx_attr *attr, struct fatx_dirent **result);
 int fatx_write_dir(struct fatx_fs *fs, struct fatx_dir *dir, struct fatx_dirent *entry, struct fatx_attr *attr);

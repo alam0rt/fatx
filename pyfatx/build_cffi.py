@@ -67,6 +67,18 @@ def ffibuilder():
         include_dirs=[LIBFATX_DIR],
         library_dirs=[LIBRARY_DIR])
     ffi.cdef("""
+        #define FATX_STATUS_FILE_NOT_FOUND  ...
+        #define FATX_STATUS_ERROR           ...
+        #define FATX_STATUS_SUCCESS         ...
+        #define FATX_STATUS_NO_SPACE        ...
+        #define FATX_STATUS_EXISTS          ...
+        #define FATX_STATUS_NOT_EMPTY       ...
+        #define FATX_STATUS_IS_DIRECTORY    ...
+        #define FATX_STATUS_NOT_DIRECTORY   ...
+        #define FATX_STATUS_NAME_TOO_LONG   ...
+        #define FATX_STATUS_INVALID         ...
+        #define FATX_STATUS_FILE_TOO_LARGE  ...
+
         struct fatxfs;
 
         struct fatx_dir {
@@ -98,6 +110,7 @@ def ffibuilder():
         };
 
         typedef long int off_t;
+        typedef int... time_t;
 
         struct fatx_fs *pyfatx_open_helper(void);
 
@@ -121,6 +134,10 @@ def ffibuilder():
         int fatx_mknod(struct fatx_fs *fs, char const *path);
         int fatx_truncate(struct fatx_fs *fs, char const *path, off_t offset);
         int fatx_rename(struct fatx_fs *fs, char const *from, char const *to, bool exchange, bool no_replace);
+        int fatx_flush(struct fatx_fs *fs);
+        int fatx_sync(struct fatx_fs *fs);
+        void fatx_time_t_to_fatx_ts(const time_t in, struct fatx_ts *out);
+        time_t fatx_ts_to_time_t(const struct fatx_ts *in);
         int fatx_disk_size(char const *path, uint64_t *size);
         int fatx_disk_size_remaining(char const *path, uint64_t offset, uint64_t *size);
         int fatx_disk_format(struct fatx_fs *fs, char const *path, size_t sector_size, enum fatx_format format_type, size_t sectors_per_cluster);

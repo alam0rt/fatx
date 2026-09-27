@@ -163,6 +163,8 @@ int fatx_dirent_to_attr(struct fatx_fs *fs, struct fatx_raw_directory_entry *ent
 int fatx_attr_to_dirent(struct fatx_fs *fs, struct fatx_attr *attr, struct fatx_raw_directory_entry *entry);
 int fatx_mark_dir_entry_deleted(struct fatx_fs *fs, struct fatx_dir *dir);
 int fatx_mark_end_of_dir(struct fatx_fs *fs, struct fatx_dir *dir);
+int fatx_dir_is_empty(struct fatx_fs *fs, char const *path);
+int fatx_unlink_node(struct fatx_fs *fs, char const *path);
 
 /* Misc Functions */
 int fatx_get_path_component(char const *path, size_t component, char const **start, size_t *len);

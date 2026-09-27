@@ -55,8 +55,8 @@ struct fatx_fuse_private_data {
     char const       *log_path;
     char             *mount_point;
     char              mount_partition_drive;
-    size_t            mount_partition_offset;
-    size_t            mount_partition_size;
+    uint64_t          mount_partition_offset;
+    uint64_t          mount_partition_size;
     size_t            device_sector_size;
     size_t            device_sectors_per_cluster;
     FILE             *log_handle;
@@ -80,6 +80,8 @@ int fatx_fuse_unlink(char const *path);
 int fatx_fuse_truncate(const char *path, off_t size);
 int fatx_fuse_rename(const char *from, const char *to);
 int fatx_fuse_utimens(const char *path, const struct timespec ts[2]);
+int fatx_fuse_flush(const char *path, struct fuse_file_info *fi);
+int fatx_fuse_fsync(const char *path, int datasync, struct fuse_file_info *fi);
 void *fatx_fuse_init(struct fuse_conn_info *conn);
 void fatx_fuse_destroy(void *data);
 
@@ -112,7 +114,30 @@ static struct fuse_operations fatx_fuse_oper = {
     .truncate = fatx_fuse_truncate,
     .rename   = fatx_fuse_rename,
     .utimens  = fatx_fuse_utimens,
+    .flush    = fatx_fuse_flush,
+    .fsync    = fatx_fuse_fsync,
 };
+
+/*
+ * Convert a libfatx status to a negative errno value for FUSE.
+ */
+static int fatx_fuse_errno(int status)
+{
+    switch (status)
+    {
+    case FATX_STATUS_SUCCESS:        return 0;
+    case FATX_STATUS_FILE_NOT_FOUND: return -ENOENT;
+    case FATX_STATUS_NO_SPACE:       return -ENOSPC;
+    case FATX_STATUS_EXISTS:         return -EEXIST;
+    case FATX_STATUS_NOT_EMPTY:      return -ENOTEMPTY;
+    case FATX_STATUS_IS_DIRECTORY:   return -EISDIR;
+    case FATX_STATUS_NOT_DIRECTORY:  return -ENOTDIR;
+    case FATX_STATUS_NAME_TOO_LONG:  return -ENAMETOOLONG;
+    case FATX_STATUS_INVALID:        return -EINVAL;
+    case FATX_STATUS_FILE_TOO_LARGE: return -EFBIG;
+    default:                         return -EIO;
+    }
+}
 
 /*
  * Simple convenince function to get the private data struct.
@@ -192,7 +217,7 @@ int fatx_fuse_read_dir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_read_dir(path=\"%s\", buf=0x%p, offset=0x%zx)\n", path, buf, offset);
 
@@ -201,7 +226,7 @@ int fatx_fuse_read_dir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     if (strcmp(path, "/") != 0)
     {
         status = fatx_get_attr(pd->fs, path, &attr);
-        if (status) return status;
+        if (status) return fatx_fuse_errno(status);
 
         fatx_attr_to_stat(&attr, &stat_buf);
     }
@@ -227,7 +252,7 @@ int fatx_fuse_read_dir(const char *path, void *buf, fuse_fill_dir_t filler, off_
         {
             status = fatx_get_attr(pd->fs, parent, &attr);
             free(parent);
-            if (status) return status;
+            if (status) return fatx_fuse_errno(status);
 
             fatx_attr_to_stat(&attr, &stat_buf);
         }
@@ -247,7 +272,7 @@ int fatx_fuse_read_dir(const char *path, void *buf, fuse_fill_dir_t filler, off_
 
     /* Open the directory. */
     status = fatx_open_dir(pd->fs, path, &dir);
-    if (status) return status;
+    if (status) return fatx_fuse_errno(status);
 
     /* Iterate over directory entries, calling filler() for each. */
     while (1)
@@ -283,12 +308,17 @@ int fatx_fuse_read_dir(const char *path, void *buf, fuse_fill_dir_t filler, off_
         else
         {
             /* Error */
+            status = fatx_fuse_errno(status);
             break;
         }
 
         /* Get the next directory entry. */
         status = fatx_next_dir_entry(pd->fs, &dir);
-        if (status != FATX_STATUS_SUCCESS) break;
+        if (status != FATX_STATUS_SUCCESS)
+        {
+            status = fatx_fuse_errno(status);
+            break;
+        }
     }
 
     fatx_close_dir(pd->fs, &dir);
@@ -306,7 +336,7 @@ int fatx_fuse_get_attr(const char  *path, struct stat *stbuf)
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_get_attr(path=\"%s\")\n", path);
 
@@ -324,18 +354,7 @@ int fatx_fuse_get_attr(const char  *path, struct stat *stbuf)
     }
 
     status = fatx_get_attr(pd->fs, path, &attr);
-
-    switch (status)
-    {
-    case FATX_STATUS_SUCCESS:
-        break;
-
-    case FATX_STATUS_FILE_NOT_FOUND:
-        return -ENOENT;
-
-    default:
-        return -1;
-    }
+    if (status) return fatx_fuse_errno(status);
 
     fatx_attr_to_stat(&attr, stbuf);
 
@@ -352,29 +371,18 @@ int fatx_fuse_open(const char *path, struct fuse_file_info *fi)
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_open(path=\"%s\")\n", path);
 
     if((fi->flags & O_CREAT) == O_CREAT)
     {
         status = fatx_mknod(pd->fs, path);
-        if (status) return -ENFILE;
+        if (status) return fatx_fuse_errno(status);
     }
 
     status = fatx_get_attr(pd->fs, path, &attr);
-
-    switch (status)
-    {
-    case FATX_STATUS_SUCCESS:
-        return 0;
-
-    case FATX_STATUS_FILE_NOT_FOUND:
-        return -ENOENT;
-
-    default:
-        return -1;
-    }
+    return fatx_fuse_errno(status);
 }
 
 /*
@@ -383,13 +391,15 @@ int fatx_fuse_open(const char *path, struct fuse_file_info *fi)
 int fatx_fuse_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     struct fatx_fuse_private_data *pd;
+    int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_read(path=\"%s\", buf=0x%p, size=0x%zx, offset=0x%zx)\n", path, (void*)buf, size, offset);
 
-    return fatx_read(pd->fs, path, offset, size, buf);
+    status = fatx_read(pd->fs, path, offset, size, buf);
+    return status < 0 ? fatx_fuse_errno(status) : status;
 }
 
 /*
@@ -398,13 +408,15 @@ int fatx_fuse_read(const char *path, char *buf, size_t size, off_t offset, struc
 int fatx_fuse_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     struct fatx_fuse_private_data *pd;
+    int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_write(path=\"%s\", buf=0x%p, size=0x%zx, offset=0x%zx)\n", path, (void*)buf, size, offset);
 
-    return fatx_write(pd->fs, path, offset, size, buf);
+    status = fatx_write(pd->fs, path, offset, size, buf);
+    return status < 0 ? fatx_fuse_errno(status) : status;
 }
 
 /*
@@ -416,22 +428,11 @@ int fatx_fuse_unlink(char const *path)
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_unlink(path=\"%s\")\n", path);
     status = fatx_unlink(pd->fs, path);
-
-    switch (status)
-    {
-    case FATX_STATUS_SUCCESS:
-        return 0;
-
-    case FATX_STATUS_FILE_NOT_FOUND:
-        return -ENOENT;
-
-    default:
-        return -1;
-    }
+    return fatx_fuse_errno(status);
 }
 
 /*
@@ -443,12 +444,12 @@ int fatx_fuse_mkdir(const char *path, mode_t mode)
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_mkdir(path=\"%s\", mode=0%o)\n", path, mode);
 
     status = fatx_mkdir(pd->fs, path);
-    return (status == FATX_STATUS_SUCCESS ? 0 : -1);
+    return fatx_fuse_errno(status);
 }
 
 /*
@@ -460,21 +461,12 @@ int fatx_fuse_rmdir(const char *path)
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
-    fatx_debug(pd->fs, "fatx_fuse_mkdir(path=\"%s\")\n", path);
+    fatx_debug(pd->fs, "fatx_fuse_rmdir(path=\"%s\")\n", path);
 
     status = fatx_rmdir(pd->fs, path);
-    switch (status)
-    {
-    case FATX_STATUS_SUCCESS:
-        return 0;
-    case FATX_STATUS_END_OF_DIR:
-        return -ENOTEMPTY;
-    case FATX_STATUS_ERROR:
-    default:
-        return -1;
-    }
+    return fatx_fuse_errno(status);
 }
 
 /*
@@ -486,12 +478,12 @@ int fatx_fuse_mknod(const char *path, mode_t mode, dev_t dev)
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if (pd == NULL) return -1;
+    if (pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_mknod(path=\"%s\", mode=0%o, dev=0x%x)\n", path, mode, dev);
 
     status = fatx_mknod(pd->fs, path);
-    return (status == FATX_STATUS_SUCCESS ? 0 : -1);
+    return fatx_fuse_errno(status);
 }
 
 /*
@@ -503,12 +495,12 @@ int fatx_fuse_truncate(const char *path, off_t size)
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if(pd == NULL) return -1;
+    if(pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_truncate(path=\"%s\", size=0x%x)\n", path, size);
 
     status = fatx_truncate(pd->fs, path, size);
-    return (status == FATX_STATUS_SUCCESS ? 0 : -1);
+    return fatx_fuse_errno(status);
 }
 
 /*
@@ -520,12 +512,12 @@ int fatx_fuse_rename(const char *from, const char *to)
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if(pd == NULL) return -1;
+    if(pd == NULL) return -EIO;
 
     fatx_debug(pd->fs, "fatx_fuse_rename(from=\"%s\", to=\"%s\")\n", from, to);
 
     status = fatx_rename(pd->fs, from, to, false, false);
-    return (status == FATX_STATUS_SUCCESS ? 0 : -1);
+    return fatx_fuse_errno(status);
 }
 
 /*
@@ -538,12 +530,44 @@ int fatx_fuse_utimens(const char *path, const struct timespec ts[2])
     int status;
 
     pd = fatx_fuse_get_private_data();
-    if(pd == NULL) return -1;
+    if(pd == NULL) return -EIO;
 
     fatx_time_t_to_fatx_ts(ts[0].tv_sec, &(fat_time[0]));
     fatx_time_t_to_fatx_ts(ts[1].tv_sec, &(fat_time[1]));
     status = fatx_utime(pd->fs, path, fat_time);
-    return (status == FATX_STATUS_SUCCESS ? 0 : -1);
+    return fatx_fuse_errno(status);
+}
+
+/*
+ * Write cached filesystem state when a file descriptor is closed. This keeps
+ * the FAT on the device consistent if fatxfs stops without an unmount.
+ */
+int fatx_fuse_flush(const char *path, struct fuse_file_info *fi)
+{
+    struct fatx_fuse_private_data *pd;
+
+    pd = fatx_fuse_get_private_data();
+    if (pd == NULL) return -EIO;
+
+    fatx_debug(pd->fs, "fatx_fuse_flush(path=\"%s\")\n", path);
+
+    if (fatx_flush(pd->fs)) return -EIO;
+    return 0;
+}
+
+/*
+ * Write all cached filesystem state to stable storage.
+ */
+int fatx_fuse_fsync(const char *path, int datasync, struct fuse_file_info *fi)
+{
+    struct fatx_fuse_private_data *pd;
+
+    pd = fatx_fuse_get_private_data();
+    if (pd == NULL) return -EIO;
+
+    fatx_debug(pd->fs, "fatx_fuse_fsync(path=\"%s\")\n", path);
+
+    return fatx_fuse_errno(fatx_sync(pd->fs));
 }
 
 /*
@@ -615,12 +639,12 @@ int fatx_fuse_opt_proc(void *data, const char *arg, int key, struct fuse_args *o
 
     case FATX_FUSE_OPT_KEY_OFFSET:
         arg = fatx_fuse_opt_consume_key(arg);
-        pd->mount_partition_offset = strtol(arg, NULL, 0);
+        pd->mount_partition_offset = strtoull(arg, NULL, 0);
         return 0;
 
     case FATX_FUSE_OPT_KEY_SIZE:
         arg = fatx_fuse_opt_consume_key(arg);
-        pd->mount_partition_size = strtol(arg, NULL, 0);
+        pd->mount_partition_size = strtoull(arg, NULL, 0);
         return 0;
 
     case FATX_FUSE_OPT_KEY_SECTOR_SIZE:
@@ -807,7 +831,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    pd.fs = malloc(sizeof(struct fatx_fs));
+    pd.fs = calloc(1, sizeof(struct fatx_fs));
     if (pd.fs == NULL)
     {
         fprintf(stderr, "no memory\n");
