@@ -188,7 +188,10 @@ int fatx_close_device(struct fatx_fs *fs)
     fatx_debug(fs, "fatx_close_device()\n");
 
     status = fatx_flush_fat_cache(fs);
+    free(fs->fat_cache.data);
+    fs->fat_cache.data = NULL;
     fclose(fs->device);
+    fs->device = NULL;
     return status;
 }
 
