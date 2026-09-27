@@ -685,5 +685,104 @@ class RegressionTest(unittest.TestCase):
 			time.tzset()
 
 
+# Geometry of the retail C partition that Fatx.create() makes.
+C_OFFSET = 0x8ca80000
+C_SIZE = 0x1f400000
+CLUSTER_SIZE = 16 * 1024
+DIRENT_SIZE = 64
+DIRENTS_PER_CLUSTER = CLUSTER_SIZE // DIRENT_SIZE
+
+
+def c_root_offset():
+	"""
+	Return the image offset of the root directory cluster of the C partition.
+	"""
+	fat_entries = C_SIZE // CLUSTER_SIZE + 1
+	fat_size = fat_entries * (2 if fat_entries < 0xfff0 else 4)
+	fat_size = (fat_size + 4095) // 4096 * 4096
+	return C_OFFSET + 4096 + fat_size
+
+
+def close(fs):
+	assert lib.fatx_close_device(fs.fs) == 0
+	fs.fs = None
+
+
+class CriticalRegressionTest(unittest.TestCase):
+	"""
+	Tests for the critical bugs found in the audit of libfatx.
+	"""
+
+	@with_formatted_disk
+	def test_many_entries_do_not_corrupt_other_files(self, path):
+		fs = Fatx(path)
+		fs.write('/data', b'A' * 64)
+		names = ['f%03d' % i for i in range(2 * DIRENTS_PER_CLUSTER + 10)]
+		for n in names:
+			fs.mknod('/' + n)
+		assert fs.read('/data') == b'A' * 64
+		listed = [a.filename for a in fs.listdir('/')]
+		assert listed == ['data'] + names
+		for n in names:
+			assert fs.get_attr('/' + n).file_size == 0
+
+	@with_formatted_disk
+	def test_full_cluster_without_end_marker(self, path):
+		# Fill every slot of the root cluster, with no end marker. Then the
+		# cluster chain is the only end of the directory.
+		fs = Fatx(path)
+		fs.write('/data', b'B' * 64)
+		for i in range(1, DIRENTS_PER_CLUSTER - 1):
+			fs.mknod('/f%03d' % i)
+		close(fs)
+		root = c_root_offset()
+		with open(path, 'r+b') as f:
+			f.seek(root + (DIRENTS_PER_CLUSTER - 2) * DIRENT_SIZE)
+			last = bytearray(f.read(DIRENT_SIZE))
+			last[2:6] = b'last'
+			f.seek(root + (DIRENTS_PER_CLUSTER - 1) * DIRENT_SIZE)
+			f.write(last)
+
+		fs = Fatx(path)
+		assert len(list(fs.listdir('/'))) == DIRENTS_PER_CLUSTER
+		d = ffi.new('struct fatx_dir *')
+		assert lib.fatx_open_dir(fs.fs, b'/does-not-exist', d) == lib.FATX_STATUS_FILE_NOT_FOUND
+		attr = ffi.new('struct fatx_attr *')
+		assert lib.fatx_get_attr(fs.fs, b'/does-not-exist/x', attr) == lib.FATX_STATUS_FILE_NOT_FOUND
+		assert lib.fatx_get_attr(fs.fs, b'/nope', attr) == lib.FATX_STATUS_FILE_NOT_FOUND
+
+		fs.mknod('/new')
+		fs.write('/new2', b'C' * 64)
+		assert fs.read('/data') == b'B' * 64
+		assert fs.read('/new2') == b'C' * 64
+		assert fs.get_attr('/new').file_size == 0
+
+	@with_formatted_disk
+	def test_bad_filename_length(self, path):
+		fs = Fatx(path)
+		fs.mknod('/a')
+		close(fs)
+		with open(path, 'r+b') as f:
+			f.seek(c_root_offset())
+			f.write(bytes([200]))
+
+		fs = Fatx(path)
+		attr = ffi.new('struct fatx_attr *')
+		assert lib.fatx_get_attr(fs.fs, b'/a', attr) == lib.FATX_STATUS_ERROR
+
+	@with_formatted_disk
+	def test_path_components_match_whole_names(self, path):
+		fs = Fatx(path)
+		fs.mkdir('/foobar')
+		fs.mkdir('/foobar/x')
+		fs.write('/foobar/x/y', b'keep')
+		attr = ffi.new('struct fatx_attr *')
+		assert lib.fatx_get_attr(fs.fs, b'/foo/x/y', attr) == lib.FATX_STATUS_FILE_NOT_FOUND
+		assert lib.fatx_unlink(fs.fs, b'/f/x/y') == lib.FATX_STATUS_FILE_NOT_FOUND
+		assert lib.fatx_get_attr(fs.fs, b'/foobarbaz/x/y', attr) == lib.FATX_STATUS_FILE_NOT_FOUND
+		assert fs.read('/foobar/x/y') == b'keep'
+		assert fs.read('/foobar//x/y') == b'keep'
+
+
 if __name__ == '__main__':
 	unittest.main()
