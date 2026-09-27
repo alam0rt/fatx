@@ -22,6 +22,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "fatx_internal.h"
 
 /*
@@ -76,7 +82,8 @@ int fatx_open_device(struct fatx_fs *fs, char const *path, uint64_t offset, uint
 
     if (fatx_init_superblock(fs, sectors_per_cluster))
     {
-        return FATX_STATUS_ERROR;
+        retval = FATX_STATUS_ERROR;
+        goto cleanup;
     }
 
     /* Validate that an acceptable cluster+sector combo was configured */
@@ -133,10 +140,19 @@ int fatx_open_device(struct fatx_fs *fs, char const *path, uint64_t offset, uint
         fs->fat_size += 4096 - fs->fat_size % 4096;
     }
 
+    /* The partition must hold the superblock, the FAT and the root cluster. */
+    if (fs->partition_size < FATX_FAT_OFFSET + fs->fat_size + fs->bytes_per_cluster)
+    {
+        fatx_error(fs, "partition is too small\n");
+        retval = FATX_STATUS_ERROR;
+        goto cleanup;
+    }
+
     /* Calculate start of data clusters. */
     fs->cluster_offset = fs->fat_offset + fs->fat_size;
     fs->num_clusters = (fs->partition_size - fs->fat_size - FATX_FAT_OFFSET) / fs->bytes_per_cluster;
     fs->num_clusters += FATX_FAT_RESERVED_ENTRIES_COUNT;
+    fs->alloc_hint = 2;
 
     fatx_info(fs, "Partition Info:\n");
     fatx_info(fs, "  Device Path:         %s\n",          fs->device_path);
@@ -158,6 +174,7 @@ int fatx_open_device(struct fatx_fs *fs, char const *path, uint64_t offset, uint
     /* Close device. */
 cleanup:
     fclose(fs->device);
+    fs->device = NULL;
     return retval;
 }
 
@@ -173,4 +190,51 @@ int fatx_close_device(struct fatx_fs *fs)
     status = fatx_flush_fat_cache(fs);
     fclose(fs->device);
     return status;
+}
+
+/*
+ * Write cached FAT entries and buffered data to the device.
+ */
+int fatx_flush(struct fatx_fs *fs)
+{
+    int status;
+
+    fatx_debug(fs, "fatx_flush()\n");
+
+    status = fatx_flush_fat_cache(fs);
+    if (status) return status;
+
+    if (fflush(fs->device))
+    {
+        fatx_error(fs, "failed to flush device\n");
+        return FATX_STATUS_ERROR;
+    }
+
+    return FATX_STATUS_SUCCESS;
+}
+
+/*
+ * Write cached FAT entries and buffered data to the device, then wait until
+ * the device has them on stable storage.
+ */
+int fatx_sync(struct fatx_fs *fs)
+{
+    int status;
+
+    fatx_debug(fs, "fatx_sync()\n");
+
+    status = fatx_flush(fs);
+    if (status) return status;
+
+#ifdef _WIN32
+    if (_commit(_fileno(fs->device)))
+#else
+    if (fsync(fileno(fs->device)))
+#endif
+    {
+        fatx_error(fs, "failed to sync device\n");
+        return FATX_STATUS_ERROR;
+    }
+
+    return FATX_STATUS_SUCCESS;
 }
