@@ -131,11 +131,33 @@ char *fatx_basename(const char *path)
 }
 
 /*
+ * FATX stores the year as a 7-bit offset from FATX_EPOCH. Move a time stamp
+ * outside of that range to the nearest time stamp that FATX can store.
+ */
+static void fatx_clamp_ts(struct fatx_ts const *in, struct fatx_ts *out)
+{
+    *out = *in;
+
+    if (in->year < FATX_EPOCH)
+    {
+        *out = (struct fatx_ts){ .year = FATX_EPOCH, .month = 1, .day = 1 };
+    }
+    else if (in->year > FATX_EPOCH + 127)
+    {
+        *out = (struct fatx_ts){ .year = FATX_EPOCH + 127, .month = 12, .day = 31,
+                                 .hour = 23, .minute = 59, .second = 58 };
+    }
+}
+
+/*
  * Pack a FATX date.
  */
 int fatx_pack_date(struct fatx_ts *in, uint16_t *out)
 {
-    *out = FATX_DATE(in->day, in->month, in->year);;
+    struct fatx_ts ts;
+
+    fatx_clamp_ts(in, &ts);
+    *out = FATX_DATE(ts.day, ts.month, ts.year);
     return FATX_STATUS_SUCCESS;
 }
 
@@ -155,7 +177,10 @@ int fatx_unpack_date(uint16_t in, struct fatx_ts *out)
  */
 int fatx_pack_time(struct fatx_ts *in, uint16_t *out)
 {
-    *out = FATX_TIME(in->hour, in->minute, in->second);;
+    struct fatx_ts ts;
+
+    fatx_clamp_ts(in, &ts);
+    *out = FATX_TIME(ts.hour, ts.minute, ts.second);
     return FATX_STATUS_SUCCESS;
 }
 
@@ -173,21 +198,31 @@ int fatx_unpack_time(uint16_t in, struct fatx_ts *out)
 void fatx_time_t_to_fatx_ts(const time_t in, struct fatx_ts *out)
 {
     struct tm *t;
+    struct fatx_ts ts;
 
     t = localtime(&in);
+    if (t == NULL)
+    {
+        *out = (struct fatx_ts){ .year = FATX_EPOCH, .month = 1, .day = 1 };
+        return;
+    }
 
-    out->second = t->tm_sec;
-    out->minute = t->tm_min;
-    out->hour   = t->tm_hour;
-    out->day    = t->tm_mday;
-    out->month  = t->tm_mon + 1;
-    out->year   = t->tm_year+1900;
+    ts.second = t->tm_sec;
+    ts.minute = t->tm_min;
+    ts.hour   = t->tm_hour;
+    ts.day    = t->tm_mday;
+    ts.month  = t->tm_mon + 1;
+    ts.year   = t->tm_year < 0 ? 0 : MIN(t->tm_year + 1900, UINT16_MAX);
+
+    fatx_clamp_ts(&ts, out);
 }
 
 time_t fatx_ts_to_time_t(const struct fatx_ts *in)
 {
     struct tm t;
 
+    memset(&t, 0, sizeof(t));
+    t.tm_isdst = -1; /* Let mktime find out if daylight saving time applies. */
     t.tm_sec  = in->second;
     t.tm_min  = in->minute;
     t.tm_hour = in->hour;

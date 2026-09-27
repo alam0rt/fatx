@@ -474,7 +474,7 @@ int fatx_create_dirent(struct fatx_fs *fs, char const *path, struct fatx_dir *di
     {
         free(path_basename);
         fatx_error(fs, "filename is too long\n");
-        return FATX_STATUS_ERROR;
+        return FATX_STATUS_NAME_TOO_LONG;
     }
 
     /* Prepare filename */
@@ -515,9 +515,30 @@ int fatx_create_dirent(struct fatx_fs *fs, char const *path, struct fatx_dir *di
 }
 
 /*
- * Remove a directory entry.
+ * Remove a file.
  */
 int fatx_unlink(struct fatx_fs *fs, char const *path)
+{
+    struct fatx_attr attr;
+    int status;
+
+    status = fatx_get_attr(fs, path, &attr);
+    if (status) return status;
+
+    if (attr.attributes & FATX_ATTR_DIRECTORY)
+    {
+        fatx_error(fs, "cannot unlink a directory\n");
+        return FATX_STATUS_IS_DIRECTORY;
+    }
+
+    return fatx_unlink_node(fs, path);
+}
+
+/*
+ * Remove a directory entry and free its clusters. The entry can be a file or
+ * a directory. The caller must make sure that a directory is empty.
+ */
+int fatx_unlink_node(struct fatx_fs *fs, char const *path)
 {
     struct fatx_dirent entry, *result;
     struct fatx_attr attr;
@@ -525,7 +546,7 @@ int fatx_unlink(struct fatx_fs *fs, char const *path)
     char *path_dirname, *path_basename;
     int status;
 
-    fatx_debug(fs, "fatx_unlink(path=\"%s\")\n", path);
+    fatx_debug(fs, "fatx_unlink_node(path=\"%s\")\n", path);
 
     /* Open the directory that contains this file. */
     path_dirname = fatx_dirname(path);
@@ -598,10 +619,14 @@ int fatx_mkdir(struct fatx_fs *fs, char const *path)
 
     /* Check for existence */
     status = fatx_get_attr(fs, path, &attr);
-    if (!status)
+    if (status == FATX_STATUS_SUCCESS)
     {
         fatx_error(fs, "node already exists\n");
-        return FATX_STATUS_ERROR;
+        return FATX_STATUS_EXISTS;
+    }
+    else if (status != FATX_STATUS_FILE_NOT_FOUND)
+    {
+        return status;
     }
 
     /* Open the directory. */
@@ -627,30 +652,28 @@ int fatx_mkdir(struct fatx_fs *fs, char const *path)
 }
 
 /*
- * Remove a directory
+ * Check if a directory has no entries in use.
+ *
+ * Returns 1 if the directory is empty, 0 if it is not empty, or a negative
+ * status on error.
  */
-int fatx_rmdir(struct fatx_fs *fs, char const *path)
+int fatx_dir_is_empty(struct fatx_fs *fs, char const *path)
 {
     struct fatx_dir dir;
     struct fatx_dirent dirent, *result;
     struct fatx_attr attr;
     int status;
 
-    fatx_debug(fs, "fatx_rmdir(path=\"%s\")\n", path);
-
-    /* First, check that the directory is empty */
     status = fatx_open_dir(fs, path, &dir);
     if (status) return status;
 
-    /* Check every dirent in the directory, make sure none of them are used */
     while (1)
     {
         status = fatx_read_dir(fs, &dir, &dirent, &attr, &result);
         if (status == FATX_STATUS_SUCCESS)
         {
-            fatx_error(fs, "directory not empty\n");
-            fatx_close_dir(fs, &dir);
-            return FATX_STATUS_END_OF_DIR;
+            status = 0;
+            break;
         }
         else if (status == FATX_STATUS_FILE_DELETED)
         {
@@ -658,25 +681,61 @@ int fatx_rmdir(struct fatx_fs *fs, char const *path)
             status = fatx_next_dir_entry(fs, &dir);
             if (status != FATX_STATUS_SUCCESS)
             {
-                fatx_error(fs, "failed to read next entry");
-                fatx_close_dir(fs, &dir);
-                return FATX_STATUS_ERROR;
+                fatx_error(fs, "failed to read next entry\n");
+                status = FATX_STATUS_ERROR;
+                break;
             }
         }
         else if (status == FATX_STATUS_END_OF_DIR)
         {
-            /* Found end of directory, we can continue with the removal now */
-            fatx_close_dir(fs, &dir);
+            status = 1;
             break;
         }
         else
         {
-            /* Error */
-            fatx_close_dir(fs, &dir);
-            return FATX_STATUS_ERROR;
-        }        
+            status = FATX_STATUS_ERROR;
+            break;
+        }
+    }
+
+    fatx_close_dir(fs, &dir);
+    return status;
+}
+
+/*
+ * Remove a directory
+ */
+int fatx_rmdir(struct fatx_fs *fs, char const *path)
+{
+    struct fatx_attr attr;
+    int status;
+
+    fatx_debug(fs, "fatx_rmdir(path=\"%s\")\n", path);
+
+    if (strcmp(path, "/") == 0)
+    {
+        fatx_error(fs, "cannot remove the root directory\n");
+        return FATX_STATUS_INVALID;
+    }
+
+    status = fatx_get_attr(fs, path, &attr);
+    if (status) return status;
+
+    if ((attr.attributes & FATX_ATTR_DIRECTORY) == 0)
+    {
+        fatx_error(fs, "not a directory\n");
+        return FATX_STATUS_NOT_DIRECTORY;
+    }
+
+    /* Check that the directory is empty */
+    status = fatx_dir_is_empty(fs, path);
+    if (status < 0) return status;
+    if (status == 0)
+    {
+        fatx_error(fs, "directory not empty\n");
+        return FATX_STATUS_NOT_EMPTY;
     }
 
     /* Remove the entry from the parent dir */
-    return fatx_unlink(fs, path);
+    return fatx_unlink_node(fs, path);
 }
