@@ -20,10 +20,23 @@
 #include <stdbool.h>
 #include "fatx_internal.h"
 
+/*
+ * A FAT index is valid if the FAT has an entry for it. Index 0 holds the
+ * media descriptor.
+ */
+static bool fatx_fat_index_valid(struct fatx_fs *fs, size_t index)
+{
+    return index < fs->num_clusters;
+}
+
+/*
+ * A cluster is valid if it is fully inside the data area. The data area starts
+ * with cluster 1, and num_clusters includes the reserved entry.
+ */
 static bool fatx_cluster_valid(struct fatx_fs *fs, size_t cluster)
 {
-    return (cluster >= 0) &&
-           (cluster < fs->num_clusters + FATX_FAT_RESERVED_ENTRIES_COUNT);
+    return (cluster >= FATX_FAT_RESERVED_ENTRIES_COUNT) &&
+           (cluster < fs->num_clusters);
 }
 
 /*
@@ -89,6 +102,11 @@ int fatx_init_root(struct fatx_fs *fs)
     }
 
     chunk = malloc(fs->bytes_per_cluster);
+    if (!chunk)
+    {
+        fatx_error(fs, "failed to allocate memory for root directory\n");
+        return FATX_STATUS_ERROR;
+    }
     memset(chunk, FATX_END_OF_DIR_MARKER, fs->bytes_per_cluster);
 
     if (fatx_dev_seek(fs, fs->cluster_offset))
@@ -145,7 +163,7 @@ int fatx_populate_fat_cache(struct fatx_fs *fs, size_t index)
 
     fatx_debug(fs, "fatx_populate_fat_cache(index=%zd)\n", index);
 
-    if (!fatx_cluster_valid(fs, index))
+    if (!fatx_fat_index_valid(fs, index))
     {
         fatx_error(fs, "index number out of bounds\n");
         return FATX_STATUS_ERROR;
@@ -156,35 +174,46 @@ int fatx_populate_fat_cache(struct fatx_fs *fs, size_t index)
         return FATX_STATUS_ERROR;
     }
 
-    if (cache->data)
-    {
-        free(cache->data);
-    }
+    /* Drop the old contents first, so that a failure below leaves no cache. */
+    free(cache->data);
+    cache->data    = NULL;
+    cache->entries = 0;
+    cache->dirty   = false;
 
     cache->position   = index;
-    cache->entries    = MIN(FATX_FAT_CACHE_NUM_ENTRIES, fs->num_clusters + FATX_FAT_RESERVED_ENTRIES_COUNT - index);
+    cache->entries    = MIN(FATX_FAT_CACHE_NUM_ENTRIES, fs->num_clusters - index);
     cache->entry_size = fs->fat_type == FATX_FAT_TYPE_16 ? 2 : 4;
 
     fatx_debug(fs, "populating fat cache: [pos: %zd, entries: %zd, entry_size: %zd]\n",
                cache->position, cache->entries, cache->entry_size);
 
     cache->data = malloc(cache->entries * cache->entry_size);
+    if (!cache->data)
+    {
+        fatx_error(fs, "failed to allocate fat cache\n");
+        goto fail;
+    }
 
     if (fatx_dev_seek(fs, fs->fat_offset + cache->position * cache->entry_size))
     {
         fatx_error(fs, "failed to seek to fat cache start index %zd (offset 0x%zx)\n",
                    cache->position, fs->fat_offset + cache->position * cache->entry_size);
-        return FATX_STATUS_ERROR;
+        goto fail;
     }
 
     if (fatx_dev_read(fs, cache->data, cache->entry_size, cache->entries) != cache->entries)
     {
         fatx_error(fs, "failed to populate fat cache entries\n");
-        return FATX_STATUS_ERROR;
+        goto fail;
     }
 
-    cache->dirty = false;
     return FATX_STATUS_SUCCESS;
+
+fail:
+    free(cache->data);
+    cache->data    = NULL;
+    cache->entries = 0;
+    return FATX_STATUS_ERROR;
 }
 
 /*
@@ -196,7 +225,7 @@ int fatx_read_fat(struct fatx_fs *fs, size_t index, fatx_fat_entry *entry)
 
     fatx_debug(fs, "fatx_read_fat(index=%zd)\n", index);
 
-    if (!fatx_cluster_valid(fs, index))
+    if (!fatx_fat_index_valid(fs, index))
     {
         fatx_error(fs, "index number out of bounds\n");
         return FATX_STATUS_ERROR;
@@ -233,7 +262,7 @@ int fatx_write_fat(struct fatx_fs *fs, size_t index, fatx_fat_entry entry)
 
     fatx_debug(fs, "fatx_write_fat(index=%zd, entry=%zx)\n", index, entry);
 
-    if (!fatx_cluster_valid(fs, index))
+    if (!fatx_fat_index_valid(fs, index))
     {
         fatx_error(fs, "index number out of bounds\n");
         return FATX_STATUS_ERROR;
@@ -313,9 +342,9 @@ int fatx_cluster_number_to_byte_offset(struct fatx_fs *fs, size_t cluster, uint6
     }
 
     *offset = fs->cluster_offset
-              + (cluster - FATX_FAT_RESERVED_ENTRIES_COUNT) * fs->bytes_per_cluster;
+              + (uint64_t)(cluster - FATX_FAT_RESERVED_ENTRIES_COUNT) * fs->bytes_per_cluster;
 
-    if (*offset >= fs->partition_offset + fs->partition_size)
+    if (*offset + fs->bytes_per_cluster > fs->partition_offset + fs->partition_size)
     {
         fatx_error(fs, "Cluster %d has overrun partition limit !!!\n", cluster);
         fatx_error(fs, "Bailing to avoid corruption");
@@ -356,8 +385,7 @@ int fatx_get_next_cluster(struct fatx_fs *fs, size_t *cluster)
 int fatx_mark_cluster_available(struct fatx_fs *fs, size_t cluster)
 {
     fatx_debug(fs, "fatx_mark_cluster_available(cluster=%zd)\n", cluster);
-    fatx_write_fat(fs, cluster, 0);
-    return FATX_STATUS_SUCCESS;
+    return fatx_write_fat(fs, cluster, 0);
 }
 
 /*
@@ -368,13 +396,12 @@ int fatx_mark_cluster_end(struct fatx_fs *fs, size_t cluster)
     fatx_debug(fs, "fatx_mark_cluster_end(cluster=%zd)\n", cluster);
     if (fs->fat_type == FATX_FAT_TYPE_16)
     {
-        fatx_write_fat(fs, cluster, 0xffff);
+        return fatx_write_fat(fs, cluster, 0xffff);
     }
     else
     {
-        fatx_write_fat(fs, cluster, 0xffffffff);
+        return fatx_write_fat(fs, cluster, 0xffffffff);
     }
-    return FATX_STATUS_SUCCESS;
 }
 
 /*
@@ -416,62 +443,75 @@ int fatx_alloc_cluster(struct fatx_fs *fs, size_t *cluster, bool zero)
 {
     int status;
     fatx_fat_entry fat_entry;
-    static size_t i = 2;
-    size_t start_i;
-    bool wrapped;
+    size_t i, start_i;
     void *zero_buf;
+    bool found = false;
 
     fatx_debug(fs, "fatx_alloc_cluster(zero: %s)\n", zero ? "true" : "false");
 
-    start_i = i;
-    wrapped = false;
-
-    for (; 1; i++)
+    /* Cluster 1 is the root directory, so the search starts at cluster 2. */
+    if (fs->num_clusters <= 2)
     {
-        if (i >= fs->num_clusters)
-        {
-            i = 2;
-            wrapped = true;
-        }
+        fatx_error(fs, "no clusters available to allocate\n");
+        return FATX_STATUS_NO_SPACE;
+    }
 
-        /* Check for the case that the FAT was full when mounting initially */
-        if (i == start_i && wrapped)
-        {
-            fatx_error(fs, "no clusters available to allocate\n");
-            return FATX_STATUS_ERROR;
-        }
+    if (fs->alloc_hint < 2 || fs->alloc_hint >= fs->num_clusters)
+    {
+        fs->alloc_hint = 2;
+    }
 
+    i = start_i = fs->alloc_hint;
+    do
+    {
         status = fatx_read_fat(fs, i, &fat_entry);
         if (status != FATX_STATUS_SUCCESS)
         {
-            fatx_error(fs, "fatx_read_fat returned status=%d, fat_entry = 0x%x\n", status, fat_entry);
+            fatx_error(fs, "fatx_read_fat returned status=%d\n", status);
             return status;
         }
 
-        status = fatx_get_fat_entry_type(fs, fat_entry);
-        if (status == FATX_CLUSTER_AVAILABLE)
+        if (fatx_get_fat_entry_type(fs, fat_entry) == FATX_CLUSTER_AVAILABLE)
         {
-            /* Found a free cluster! */
+            found = true;
             break;
         }
+
+        i += 1;
+        if (i >= fs->num_clusters)
+        {
+            i = 2;
+        }
+    } while (i != start_i);
+
+    if (!found)
+    {
+        fatx_error(fs, "no clusters available to allocate\n");
+        return FATX_STATUS_NO_SPACE;
+    }
+
+    /* Zero the cluster before it is marked as in use. */
+    if (zero)
+    {
+        status = fatx_dev_seek_cluster(fs, i, 0);
+        if (status != FATX_STATUS_SUCCESS) return status;
+
+        zero_buf = calloc(1, fs->bytes_per_cluster);
+        if (!zero_buf) return FATX_STATUS_ERROR;
+
+        if (fatx_dev_write(fs, zero_buf, fs->bytes_per_cluster, 1) != 1)
+        {
+            fatx_error(fs, "failed to zero cluster %zd\n", i);
+            free(zero_buf);
+            return FATX_STATUS_ERROR;
+        }
+        free(zero_buf);
     }
 
     status = fatx_mark_cluster_end(fs, i);
     if (status != FATX_STATUS_SUCCESS) return status;
 
-    status = fatx_dev_seek_cluster(fs, i, 0);
-    if (status != FATX_STATUS_SUCCESS) return status;
-
-    if (zero)
-    {
-        zero_buf = calloc(1, fs->bytes_per_cluster);
-        if (!zero_buf) return FATX_STATUS_ERROR;
-
-        status = fatx_dev_write(fs, zero_buf, fs->bytes_per_cluster, 1);
-        free(zero_buf);
-        if (status != 1) return status;
-    }
-
+    fs->alloc_hint = i + 1;
     *cluster = i;
 
     return FATX_STATUS_SUCCESS;
